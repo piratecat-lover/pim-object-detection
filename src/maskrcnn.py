@@ -12,7 +12,7 @@ import pandas as pd
 # Load dataset for CUB_200_2011
 
 # Caltech UCSD Birds 2011
-base_dir = './project/data/CUB_200_2011'
+base_dir = './pim-object-detection/data/CUB_200_2011'
 num_classes = 200
 
 class CUBDataset(Dataset):
