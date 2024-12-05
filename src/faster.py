@@ -1,98 +1,103 @@
-import os
-import tarfile
 import torch
 import torchvision
-from torchvision import transforms
-from PIL import Image
-import pandas as pd
+import torchvision.transforms as transforms
+from torchvision.models.detection import FasterRCNN
+from torchvision.models.detection.rpn import AnchorGenerator
+from torchvision.datasets import ImageFolder
+from torch.utils.data import DataLoader
+import os
+import tarfile
 
-# Extract the dataset from the provided location
-dataset_path = 'CUB_200_2011.tgz'  # Update with your local path if needed
-extract_path = 'cub_dataset'
+# Define device
+device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-if not os.path.exists(extract_path):
-    with tarfile.open(dataset_path, 'r:gz') as tar:
-        tar.extractall(path=extract_path)
+# Uncompress CUB-200-2011 dataset if compressed
+tar_path = 'CUB_200_2011.tgz'
+if not os.path.exists('CUB_200_2011') and os.path.exists(tar_path):
+    with tarfile.open(tar_path, 'r:gz') as tar:
+        tar.extractall('CUB_200_2011')
 
-# Dataset path adjustment
-images_path = os.path.join(extract_path, 'CUB_200_2011', 'images')
-
-# Custom Dataset Class for Faster R-CNN
-class CustomDataset(torch.utils.data.Dataset):
-    def __init__(self, root, transforms=None):
-        self.root = root
-        self.transforms = transforms
-        self.imgs = list(sorted(os.listdir(os.path.join(root, "CUB_200_2011", "images"))))
-        images = pd.read_csv(os.path.join(root, 'CUB_200_2011', 'images.txt'), sep=" ", names=["img_id", "filepath"])
-        bboxes = pd.read_csv(os.path.join(root, 'CUB_200_2011', 'bounding_boxes.txt'), sep=" ", names=["img_id", "x", "y", "width", "height"])
-        labels = pd.read_csv(os.path.join(root, 'CUB_200_2011', 'image_class_labels.txt'), sep=" ", names=["img_id", "class_id"])
-        split = pd.read_csv(os.path.join(root, 'CUB_200_2011', 'train_test_split.txt'), sep=" ", names=["img_id", "is_train"])
-        self.metadata = images.merge(bboxes, on="img_id").merge(labels, on="img_id").merge(split, on="img_id")
-
-    def __getitem__(self, idx):
-        data = self.metadata.iloc[idx]
-        img_path = os.path.join(self.root, 'CUB_200_2011', 'images', data['filepath'])
-        image = Image.open(img_path).convert("RGB")
-
-        x, y, width, height = data['x'], data['y'], data['width'], data['height']
-        boxes = torch.tensor([[x, y, x + width, y + height]], dtype=torch.float32)
-        labels = torch.tensor([data['class_id'] - 1], dtype=torch.int64)
-
-        mask = torch.zeros((1, int(image.height), int(image.width)), dtype=torch.uint8)
-        target = {"boxes": boxes, "labels": labels, "masks": mask}
-
-        if self.transforms:
-            image = self.transforms(image)
-
-        return image, target
-
-    def __len__(self):
-        return len(self.imgs)
-
-# Define the transforms and dataset
+# Load the CUB-200-2011 dataset
+# Assuming the dataset is organized in an ImageFolder-compatible format
 transform = transforms.Compose([
-    transforms.Resize((256, 256)),  # Resize to speed up training
-    transforms.ToTensor()
+    transforms.ToTensor(),
 ])
 
-dataset = CustomDataset(root=extract_path, transforms=transform)
-data_loader = torch.utils.data.DataLoader(dataset, batch_size=2, shuffle=True, num_workers=2, collate_fn=lambda x: tuple(zip(*x)))
+dataset = ImageFolder(root='CUB_200_2011/images', transform=transform)
+dataloader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=2, collate_fn=lambda x: tuple(zip(*x)))
 
-# Load the pre-trained Faster R-CNN model
-model = torchvision.models.detection.fasterrcnn_resnet50_fpn(weights=torchvision.models.detection.FasterRCNN_ResNet50_FPN_Weights.COCO_V1)
+# Load a pre-trained backbone for Faster R-CNN
+backbone = torchvision.models.resnet50(pretrained=True)
+backbone = torch.nn.Sequential(*list(backbone.children())[:-2])
+backbone.out_channels = 2048
 
-# Update the classifier head
-num_classes = 201  # Update with the number of classes including background
-in_features = model.roi_heads.box_predictor.cls_score.in_features
-model.roi_heads.box_predictor = torchvision.models.detection.faster_rcnn.FastRCNNPredictor(in_features, num_classes)
+# Define the anchor generator for the FPN which is used in Faster R-CNN
+anchor_generator = AnchorGenerator(
+    sizes=((32, 64, 128, 256, 512),),
+    aspect_ratios=((0.5, 1.0, 2.0),) * 5
+)
 
-# Set the device
-device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+# Define the Region of Interest (RoI) Pooler
+roi_pooler = torchvision.ops.MultiScaleRoIAlign(
+    featmap_names=['0'],
+    output_size=7,
+    sampling_ratio=2
+)
+
+# Build the Faster R-CNN model
+num_classes = 201  # Set this to the number of classes in the CUB-200-2011 dataset (200 bird species + 1 background)
+model = FasterRCNN(
+    backbone,
+    num_classes=num_classes,
+    rpn_anchor_generator=anchor_generator,
+    box_roi_pool=roi_pooler
+)
+
+# Move model to device
 model.to(device)
 
-# Optimizer setup
-params = [p for p in model.parameters() if p.requires_grad]
-optimizer = torch.optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=0.0005)
+# Define optimizer and learning rate scheduler
+optimizer = torch.optim.SGD(params=[p for p in model.parameters() if p.requires_grad], lr=0.005, momentum=0.9, weight_decay=0.0005)
+lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
 
 # Training loop
-num_epochs = 5  # Reduce number of epochs for initial testing
-for epoch in range(num_epochs):
+def train(model, dataloader, optimizer, lr_scheduler, device, num_epochs):
     model.train()
-    i = 0
-    for images, targets in data_loader:
-        images = list(image.to(device) for image in images)
-        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+    for epoch in range(num_epochs):
+        epoch_loss = 0
+        for images, targets in dataloader:
+            images = list(image.to(device) for image in images)
+            targets = [{'boxes': torch.tensor([[0.0, 0.0, 1.0, 1.0]], device=device), 'labels': torch.tensor([1], device=device)} for _ in images]  # Placeholder targets, replace with actual annotations
 
-        # Calculate loss
-        loss_dict = model(images, targets)
-        losses = sum(loss for loss in loss_dict.values())
+            # Zero the gradient
+            optimizer.zero_grad()
 
-        # Backpropagation
-        optimizer.zero_grad()
-        losses.backward()
-        optimizer.step()
+            # Forward pass
+            loss_dict = model(images, targets)
+            losses = sum(loss for loss in loss_dict.values())
+            
+            # Backward pass
+            losses.backward()
+            optimizer.step()
 
-        i += 1
-        print(f"Epoch [{epoch + 1}/{num_epochs}], Step [{i}/{len(data_loader)}], Loss: {losses.item():.4f}")
+            epoch_loss += losses.item()
 
-print("Training completed!")
+        # Update learning rate
+        lr_scheduler.step()
+        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss}")
+
+# Start training
+train(model, dataloader, optimizer, lr_scheduler, device, num_epochs=10)
+
+# Save the model
+torch.save(model.state_dict(), 'faster_rcnn_cub200.pth')
+
+# Vessl-specific code
+import vessl
+vessl.init()
+
+# Log training process to Vessl
+train(model, dataloader, optimizer, lr_scheduler, device, num_epochs=10)
+
+# Save the model
+vessl.log({'model_path': 'faster_rcnn_cub200.pth'})
